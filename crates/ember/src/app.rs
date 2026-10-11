@@ -184,12 +184,19 @@ fn router(app: &App, kit: Kit) -> Router {
             let private = request.uri().path().trim_start_matches('/').strip_prefix("first_run").is_some_and(|suffix| {
                 (protected_setup && (suffix.is_empty() || suffix.starts_with(['/', '.']))) || suffix.trim_start_matches('/') == "access"
             });
+            let token_free_form =
+                protected_setup && request.uri().path() == "/first_run" && request.uri().query().is_none_or(str::is_empty);
             let mut response = next.run(request).await;
             if private {
-                // Include parser failures and SSL redirects, which happen before an action has a
-                // Ctx and cannot inherit the setup controller's response headers.
+                // Only the authorized form renderer opts into same-origin referrers. Parser
+                // failures, CSRF errors, access responses and SSL redirects remain no-referrer.
+                let rendered_form = token_free_form
+                    && matches!(response.status(), ember_kit::StatusCode::OK | ember_kit::StatusCode::UNPROCESSABLE_ENTITY)
+                    && response.headers().get("referrer-policy").is_some_and(|policy| policy == "same-origin");
                 response.headers_mut().insert("cache-control", axum::http::HeaderValue::from_static("no-store"));
-                response.headers_mut().insert("referrer-policy", axum::http::HeaderValue::from_static("no-referrer"));
+                if !rendered_form {
+                    response.headers_mut().insert("referrer-policy", axum::http::HeaderValue::from_static("no-referrer"));
+                }
             }
             response
         },

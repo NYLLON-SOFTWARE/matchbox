@@ -99,7 +99,18 @@ pub(super) fn clear_cookie(c: &mut Ctx) {
 }
 
 pub(super) fn finish_form(c: &mut Ctx, result: Result) -> Result {
-    if c.app().config.setup_token.is_some() { finish_private(c, result) } else { result }
+    if c.app().config.setup_token.is_none() {
+        return result;
+    }
+    finish_private(c, result).map(|response| {
+        if matches!(response.status, StatusCode::OK | StatusCode::UNPROCESSABLE_ENTITY) {
+            // Native forms with no-referrer send Origin: null and fail CSRF checks. Only an
+            // authorized, token-free form render may send its referrer to the same origin.
+            response.header("referrer-policy", "same-origin")
+        } else {
+            response
+        }
+    })
 }
 
 fn finish_private(c: &mut Ctx, result: Result) -> Result {
