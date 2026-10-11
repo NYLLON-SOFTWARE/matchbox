@@ -1,6 +1,6 @@
 # KRO browser checks
 
-Build the Rust binary, then run:
+Build the Rust binary and put OpenSSL with `req -addext` support on `PATH`, then run:
 
 ```sh
 npm ci --prefix parity
@@ -29,6 +29,18 @@ transition into legacy pages (including Turbo frames). Authenticated message req
 ETags, matching cached HTML, conditional 304 responses, and invalidation after posting a message.
 A navigation fixture exercises Turbo cached restoration before an
 account is created, because the real setup route correctly becomes unavailable afterward.
+
+Protected setup checks exercise the private fragment link over a disposable HTTPS proxy. Chromium
+trusts only that fixture certificate's public key, and Node probes verify its exact certificate.
+The checks hold the application module until the form is visible, then verify native submission
+before Turbo starts and submission after Turbo starts. Both paths must preserve same-origin CSRF
+checks, return the password validation form, retain name/email, clear the password, and complete
+signup with automatic sign-in. Locked setup, query rejection, private-link headers, and cookie
+invalidation remain covered without retaining credentials in diagnostics. Run this case alone with:
+
+```sh
+node --test --test-name-pattern="protected setup" parity/kro/protected-setup.test.mjs
+```
 
 Translation visibility checks cover the hidden default, persistence, administrator changes,
 public and authenticated pages, Turbo document reloads, and rejection of changes by members.

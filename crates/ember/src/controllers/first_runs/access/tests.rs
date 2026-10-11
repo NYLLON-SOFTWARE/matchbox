@@ -42,8 +42,12 @@ async fn send(app: &Booted, request: Request<Body>) -> Response<Body> {
 }
 
 fn assert_private(response: &Response<Body>) {
+    assert_referrer_policy(response, "no-referrer");
+}
+
+fn assert_referrer_policy(response: &Response<Body>, policy: &str) {
     assert_eq!(response.headers()["cache-control"], "no-store");
-    assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+    assert_eq!(response.headers()["referrer-policy"], policy);
 }
 
 async fn unlock(app: &Booted) -> String {
@@ -121,9 +125,10 @@ async fn unlock_cookie_is_short_lived_bound_to_the_current_token_and_not_a_raw_b
     let cookie = unlock(&app).await;
     let response = send(&app, request("GET", "/first_run", "", Some(&cookie))).await;
     assert_eq!(response.status(), StatusCode::OK);
-    assert_private(&response);
+    assert_referrer_policy(&response, "same-origin");
     let response = send(&app, request("GET", "/first_run/access", "", None)).await;
     assert_eq!(response.status(), StatusCode::OK);
+    assert_private(&response);
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     let body = String::from_utf8_lossy(&body);
     assert!(body.contains(&ember_assets::asset_path("setup_access.js")));
@@ -180,4 +185,67 @@ async fn completed_setup_invalidates_access_and_clears_the_host_cookie() {
         assert!(expired.contains("1970"));
     }
     assert_eq!(app.app.db.read(ember_db::Account::count).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn authorized_native_setup_validation_preserves_the_form_and_same_origin_policy() {
+    let (app, _dir) = app(TOKEN).await;
+    let cookie = unlock(&app).await;
+    let mut native =
+        request("POST", "/first_run", "user[name]=Ada&user[email_address]=ada%40example.test&user[password]=short", Some(&cookie));
+    native.headers_mut().insert("accept", "text/html,application/xhtml+xml".parse().unwrap());
+    native.headers_mut().insert("sec-fetch-mode", "navigate".parse().unwrap());
+    native.headers_mut().insert("sec-fetch-dest", "document".parse().unwrap());
+    let response = send(&app, native).await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_referrer_policy(&response, "same-origin");
+    let html = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await.unwrap().to_vec()).unwrap();
+    assert!(html.contains("aria-invalid=\"true\""));
+    assert!(html.contains("value=\"Ada\""));
+    assert!(html.contains("value=\"ada@example.test\""));
+    let password = html.split('<').find(|tag| tag.starts_with("input ") && tag.contains("id=\"user_password\"")).unwrap();
+    assert!(!password.contains("value="));
+    assert!(!html.contains(TOKEN));
+    assert_eq!(app.app.db.read(ember_db::Account::count).await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn setup_form_csrf_and_parser_errors_never_opt_into_same_origin_referrers() {
+    let (app, _dir) = app(TOKEN).await;
+    let cookie = unlock(&app).await;
+    let body = "user[name]=Ada&user[email_address]=ada%40example.test&user[password]=short";
+    for (origin, site) in [
+        ("null", Some("same-origin")),
+        ("https://attacker.test", Some("same-origin")),
+        ("https://campfire.test", Some("cross-site")),
+        ("https://campfire.test", None),
+    ] {
+        let mut forged = request("POST", "/first_run", body, Some(&cookie));
+        forged.headers_mut().insert("origin", origin.parse().unwrap());
+        match site {
+            Some(site) => {
+                forged.headers_mut().insert("sec-fetch-site", site.parse().unwrap());
+            }
+            None => {
+                forged.headers_mut().remove("sec-fetch-site");
+            }
+        }
+        forged.headers_mut().insert("referrer-policy", "same-origin".parse().unwrap());
+        let response = send(&app, forged).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_private(&response);
+        let html = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(!String::from_utf8_lossy(&html).contains("id=\"user_password\""));
+    }
+    for (method, path, body, status) in [
+        ("GET", "/first_run?token=secret", "", StatusCode::BAD_REQUEST),
+        ("POST", "/first_run?token=secret", body, StatusCode::BAD_REQUEST),
+        ("POST", "/first_run", "user=one&user[]=two", StatusCode::BAD_REQUEST),
+        ("GET", "/first_run.json", "", StatusCode::NOT_ACCEPTABLE),
+    ] {
+        let response = send(&app, request(method, path, body, Some(&cookie))).await;
+        assert_eq!(response.status(), status, "{method} {path}");
+        assert_private(&response);
+    }
+    assert_eq!(app.app.db.read(ember_db::Account::count).await.unwrap(), 0);
 }

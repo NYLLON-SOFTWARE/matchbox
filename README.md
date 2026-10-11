@@ -54,9 +54,13 @@ Installer-managed deployments require a private setup link before the existing f
 be opened. `EMBER_SETUP_TOKEN` is optional for existing manual deployments. The link exchanges a
 fragment-only credential over HTTPS for a Secure, HttpOnly, encrypted cookie that expires after
 15 minutes. Account creation invalidates setup access. The form, avatar upload, validation, and
-automatic sign-in remain the same. Query-string setup credentials are rejected. First-run paths
-omit query and error details from logs for all deployments. Their HTTP-to-HTTPS redirects use
-no-store/no-referrer and reject queries before constructing a redirect, including manual installs.
+automatic sign-in remain the same. Query-string setup credentials are rejected. Authorized,
+token-free setup forms and their validation responses use `Referrer-Policy: same-origin` so
+native submissions work before JavaScript loads without sending cross-origin referrers.
+Other protected setup responses retain `no-referrer`; all protected setup responses remain
+`no-store`. First-run paths omit query and error details from logs for all deployments. Their
+HTTP-to-HTTPS redirects use no-store/no-referrer and reject queries before constructing a
+redirect, including manual installs.
 
 NYLLON's reviewed Docker installer and `emberctl` live in `deploy/installer/`. They support fresh
 Ubuntu 24.04 and Debian 13 servers on amd64 and arm64, preserve deployment secrets, pin images by

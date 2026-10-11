@@ -104,7 +104,7 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 24
-      - name: Verify persisted message targets and optimistic browser sends
+      - name: Verify message reconciliation and protected browser setup
         run: |
           npm ci --ignore-scripts --prefix parity
           # Keep the browser and app inside the same Debian/media environment as the tests.
@@ -116,6 +116,7 @@ jobs:
               cargo build --locked -p ember --bin ember
               node parity/node_modules/playwright/cli.js install --with-deps chromium
               node --test --test-name-pattern="reused client message IDs|rapid messages" parity/kro/workspace.test.mjs
+              node --test --test-name-pattern="protected setup" parity/kro/protected-setup.test.mjs
             '
 
   benchmark-contracts:

@@ -23,21 +23,21 @@ try {
   })
   if (phase === 'setup') {
     const token = process.env.EMBER_TEST_TOKEN
-    assert.match(token, /^[a-f0-9]{64}$/)
+    assert.ok(typeof token === 'string' && /^[a-f0-9]{64}$/.test(token), 'Expected a disposable setup credential')
     const direct = await context.request.get('/first_run')
     assert.equal(direct.status(), 403)
     assert.equal(direct.headers()['cache-control'], 'no-store')
     assert.equal(direct.headers()['referrer-policy'], 'no-referrer')
-    const query = await context.request.get('/first_run/access?token=' + token)
+    const query = await context.request.get('/first_run/access?token=not-a-credential')
     assert.equal(query.status(), 400)
     const bad = await context.request.post('/first_run/access', { form: { token: '0'.repeat(64) }, headers: { Origin: origin, 'Sec-Fetch-Site': 'same-origin' } })
     assert.equal(bad.status(), 403)
     const foreign = await context.request.post('/first_run/access', { form: { token }, headers: { Origin: 'https://attacker.example', 'Sec-Fetch-Site': 'cross-site' } })
     assert.equal(foreign.status(), 422)
     page.on('request', request => assert.ok(!request.url().includes(token), 'Setup credential must never enter a request URL'))
-    await page.goto('/first_run/access#token=' + token)
+    await page.goto('/first_run/access#token=' + token).catch(() => { throw new Error('Private setup navigation failed') })
     await page.locator('#user_name').waitFor()
-    assert.equal(new URL(page.url()).hash, '')
+    assert.ok(new URL(page.url()).hash === '', 'Setup must clear its private fragment')
     const cookie = (await context.cookies()).find(value => value.name === '__Host-ember_setup')
     assert.ok(cookie?.secure && cookie.httpOnly && cookie.path === '/' && cookie.sameSite === 'Strict')
     assert.ok(cookie.expires > Date.now() / 1000 + 850 && cookie.expires < Date.now() / 1000 + 910)
@@ -48,15 +48,34 @@ try {
     await page.locator('#user_name').fill('Ember Acceptance Admin')
     await page.locator('#user_email_address').fill('admin@example.test')
     await page.locator('#user_password').fill('short')
-    const invalidSetup = page.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname === '/first_run')
-    // Bypass client minlength to exercise the server's rejected-form path.
-    await page.locator('form').first().evaluate(form => { form.noValidate = true; form.requestSubmit() })
-    assert.equal((await invalidSetup).status(), 422)
-    await page.locator('#user_password[aria-invalid="true"]').waitFor()
-    assert.equal(await page.locator('#user_name').inputValue(), 'Ember Acceptance Admin')
-    assert.equal(await page.locator('#user_email_address').inputValue(), 'admin@example.test')
-    assert.equal(await page.locator('#user_password').inputValue(), '')
-    assert.equal(await page.locator('#composer').count(), 0)
+    async function rejectShortPassword(native) {
+      const invalidSetup = page.waitForResponse(response => response.request().method() === 'POST' && new URL(response.url()).pathname === '/first_run')
+      // Exercise the native fallback independently of Turbo initialization, then its fetch path.
+      // Both bypass client minlength so server-side validation remains a required gate.
+      await page.locator('form').first().evaluate((form, native) => {
+        form.noValidate = true
+        if (native) HTMLFormElement.prototype.submit.call(form)
+        else form.requestSubmit()
+      }, native)
+      const response = await invalidSetup
+      assert.equal(response.status(), 422)
+      assert.equal(response.request().isNavigationRequest(), native)
+      assert.equal((await response.request().allHeaders()).origin, origin)
+      assert.equal(response.headers()['cache-control'], 'no-store')
+      assert.equal(response.headers()['referrer-policy'], 'same-origin')
+      const passwordInput = (await response.text()).match(/<input\b[^>]*\bid="user_password"[^>]*>/)?.[0]
+      // Report a fixed assertion message, never the credential-bearing response body.
+      assert.ok(passwordInput?.includes('aria-invalid="true"'), 'Server must return the invalid-password setup form')
+      await page.locator('#user_password[aria-invalid="true"]').waitFor()
+      assert.equal(await page.locator('#user_name').inputValue(), 'Ember Acceptance Admin')
+      assert.equal(await page.locator('#user_email_address').inputValue(), 'admin@example.test')
+      assert.equal(await page.locator('#user_password').inputValue(), '')
+      assert.equal(await page.locator('#composer').count(), 0)
+    }
+    await rejectShortPassword(true)
+    await page.waitForFunction(() => window.Turbo?.session?.started === true)
+    await page.locator('#user_password').fill('short')
+    await rejectShortPassword(false)
     await page.locator('#user_password').fill(password)
     await page.locator('#user_avatar').setInputFiles({ name: 'avatar.png', mimeType: 'image/png', buffer: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=', 'base64') })
     await page.getByRole('button', { name: 'Continue', exact: true }).click()

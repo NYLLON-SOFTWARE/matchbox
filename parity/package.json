@@ -9,7 +9,7 @@
     "compare": "node capture/cli.ts compare",
     "typecheck": "tsc --noEmit -p capture",
     "test": "node --test capture/test/*.test.ts",
-    "test:kro": "node --test --test-concurrency=1 kro/file-uploader.test.mjs kro/first-run.test.mjs kro/workspace.test.mjs"
+    "test:kro": "node --test --test-concurrency=1 kro/file-uploader.test.mjs kro/first-run.test.mjs kro/protected-setup.test.mjs kro/workspace.test.mjs"
   },
   "dependencies": {
     "parse5": "8.0.1",
