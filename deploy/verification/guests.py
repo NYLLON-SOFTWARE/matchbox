@@ -27,8 +27,12 @@ GUEST = '192.0.2.10'
 DOMAIN = 'chat.ember.test'
 INSTALL_COMMAND = 'curl -fsSL https://get.nyllon.com/ember | sh --'
 HOSTNAME_PROMPT = 'Hostname pointing to this server (for example chat.example.com): '
-# Ubuntu arm64 under TCG reached cloud-init config at 569s; allow bounded slow first boots.
+# Ubuntu arm64 under TCG reached cloud-final at 759s; allow bounded slow guest boots.
 GUEST_BOOT_TIMEOUT = 1200
+VERIFICATION_STARTED = time.monotonic()
+VERIFICATION_STAGES = frozenset(('guest-boot', 'guest-ssh', 'guest-cloud-init', 'guest-packages',
+    'preflight', 'first-install', 'browser-setup', 'managed-rerun', 'backup', 'reboot',
+    'reboot-ssh', 'reboot-health', 'update', 'explicit-recovery', 'restore', 'complete'))
 PEBBLE = 'ghcr.io/letsencrypt/pebble@sha256:d9080f68f6cb6af8d82134ab26de0aaaf312ac9cba42aecc6d3aede6cb63007b'
 
 
@@ -36,6 +40,16 @@ def run(*args, capture=False, check=True, timeout=600, **kwargs):
     return subprocess.run([str(x) for x in args], check=check, text=True,
                           stdout=subprocess.PIPE if capture else None,
                           stderr=subprocess.PIPE if capture else None, timeout=timeout, **kwargs)
+
+
+def report_stage(stage):
+    if stage not in VERIFICATION_STAGES:
+        raise ValueError('Unknown verification stage')
+    progress = {'stage': stage, 'elapsed_seconds': round(max(0, time.monotonic() - VERIFICATION_STARTED), 1)}
+    try:
+        print('Guest verification progress: ' + json.dumps(progress, sort_keys=True), file=sys.stderr, flush=True)
+    except OSError:
+        pass
 
 
 class InteractiveProgress:
@@ -273,7 +287,8 @@ class Guest:
             after = self.ssh(command, timeout=15).stdout.strip()
             assert after and after != before, 'Guest has not rebooted'
 
-        wait_for(rebooted)
+        report_stage('reboot-ssh')
+        wait_for(rebooted, timeout=GUEST_BOOT_TIMEOUT)
 
     def install(self, command=INSTALL_COMMAND, check=True, fresh=False):
         session = installer_session_command(command)
@@ -299,6 +314,7 @@ class Guest:
             source, 'root@' + GUEST + ':' + destination, capture=True, timeout=120)
 
     def boot(self, os_name, arch):
+        report_stage('guest-boot')
         item = json.loads((ROOT / 'deploy/verification/guests.lock.json').read_text())[os_name + '/' + arch]
         image = WORK / 'base.qcow2'
         run('curl', '--fail', '--location', '--retry', '3', '--output', image, item['url'])
@@ -318,8 +334,11 @@ class Guest:
         log = (WORK / 'diagnostics/console.log').open('w')
         self.process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
         atexit.register(self.process.terminate)
+        report_stage('guest-ssh')
         self.wait_for_ssh()
+        report_stage('guest-cloud-init')
         self.ssh('cloud-init status --wait')
+        report_stage('guest-packages')
         self.ssh('apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y curl ca-certificates python3')
 
     def wait_for_ssh(self):
@@ -496,6 +515,7 @@ def docker_override(guest, contents):
 
 
 def acceptance(guest, assets, certs, overrides, public):
+    report_stage('preflight')
     guest.copy(certs / 'ca.pem', '/usr/local/share/ca-certificates/ember-runner.crt')
     guest.copy(certs / 'issuer.pem', '/usr/local/share/ca-certificates/ember-issuer.crt')
     guest.ssh('update-ca-certificates')
@@ -541,6 +561,7 @@ def acceptance(guest, assets, certs, overrides, public):
     guest.ssh("dpkg-query -W -f='${Status}' runc | grep -q 'install ok installed'")
     guest.ssh('test ! -e /etc/apt/sources.list.d/docker.sources && test ! -e /etc/ember')
     guest.ssh('DEBIAN_FRONTEND=noninteractive apt-get remove -y runc')
+    report_stage('first-install')
     result = guest.install(fresh=True)
     assert result.stdout.count(HOSTNAME_PROMPT) == 1, 'The advertised command must prompt for the hostname through the real terminal'
     state = json.loads(guest.ssh('cat /etc/ember/state.json').stdout)
@@ -553,21 +574,27 @@ def acceptance(guest, assets, certs, overrides, public):
     assert all(key + '=' + value in container['Config']['Env'] for key, value in expected_runtime.items())
     assert any(mount['Source'] == '/etc/ember/test-ca.pem' and mount['Destination'] == '/run/ember-test-ca.pem' and mount['RW'] is False for mount in container['Mounts']), 'The explicit test CA must be mounted read-only'
     token = re.search(r'/first_run/access#token=([a-f0-9]{64})', result.stdout).group(1)
+    report_stage('browser-setup')
     browser('setup', token)
+    report_stage('managed-rerun')
     baseline = guest.ssh('sha256sum /etc/ember/app.env').stdout
     repeated = guest.install()  # Working Docker and existing managed deployment; preserve all state.
     assert HOSTNAME_PROMPT not in repeated.stdout, 'Rerunning the advertised command must retain the managed hostname'
     assert guest.ssh('sha256sum /etc/ember/app.env').stdout == baseline
+    report_stage('backup')
     guest.ssh('emberctl backup')
     backup = guest.ssh('find /var/lib/ember/backups -mindepth 1 -maxdepth 1 -type d | sort | tail -1').stdout.strip().split('/')[-1]
+    report_stage('reboot')
     run('docker', 'stop', 'ember-pebble', capture=True)  # Cached certificates must survive without the CA.
     guest.reboot()
+    report_stage('reboot-health')
     wait_for(lambda: guest.ssh('emberctl status', timeout=15))
     wait_for(lambda: guest.ssh('curl -fsS --connect-timeout 3 --max-time 10 https://' + DOMAIN + '/up', timeout=15))
     assert guest.ssh('sha256sum /etc/ember/app.env').stdout == baseline
     browser('persist')
     run('docker', 'start', 'ember-pebble', capture=True)
     if not public:
+        report_stage('update')
         manifest = json.loads((assets / 'release.json').read_text())
         parts = list(map(int, manifest['version'].split('.')))
         parts[2] += 1
@@ -603,15 +630,18 @@ def acceptance(guest, assets, certs, overrides, public):
         with docker_override(guest, startup_failure):
             failed = guest.ssh('emberctl update ' + failed_version, check=False)
             require_preflight_refusal(failed, 'restore', 'Failed startup must require explicit recovery')
+        report_stage('explicit-recovery')
         journal = json.loads(guest.ssh('cat /var/lib/ember/recovery.json').stdout)
         guest.ssh('emberctl restore ' + shlex.quote(journal['backup']) + ' --accept-data-loss')
         browser('persist')
+    report_stage('restore')
     guest.ssh('emberctl restore ' + shlex.quote(backup) + ' --accept-data-loss')
     assert guest.ssh('sha256sum /etc/ember/app.env').stdout == baseline
     browser('persist')
     assert guest.ssh('emberctl setup-link', check=False).returncode != 0, 'Completed setup cannot be reopened'
     summary = {'os': os.environ['GUEST_OS'], 'arch': os.environ['GUEST_ARCH'], 'public': public, 'gates': ['anonymous-install', 'advertised-command-real-terminal-hostname', 'private-browser-setup', 'chat', 'upload', 'websocket', 'push-enrollment', 'rerun', 'offline-ca-reboot', 'complete-backup-restore'] + ([] if public else ['interrupted-download', 'registry-unavailable-preserves-running-app', 'update', 'failed-start-explicit-recovery'])}
     (WORK / 'diagnostics/result.json').write_text(json.dumps(summary, indent=2) + '\n')
+    report_stage('complete')
 
 
 def failure_diagnostics(guest, error):
