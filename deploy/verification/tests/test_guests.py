@@ -237,8 +237,13 @@ class InstallDeadlines(unittest.TestCase):
             stack.enter_context(mock.patch.object(guests, 'WORK', work))
             for name in ('require_privilege_refusal', 'require_preflight_refusal', 'browser'):
                 stack.enter_context(mock.patch.object(guests, name))
+            output = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
             with self.assertRaises(RuntimeError) as failure:
                 guests.acceptance(guest, work, work, {}, public=True)
+        snapshots = [guests.json.loads(line.split(': ', 1)[1]) for line in output.getvalue().splitlines()]
+        self.assertEqual([item['stage'] for item in snapshots], ['preflight', 'first-install', 'browser-setup', 'managed-rerun'])
+        self.assertNotIn('a' * 64, output.getvalue())
+        self.assertNotIn(guests.DOMAIN, output.getvalue())
         self.assertIs(failure.exception, stop)
         self.assertEqual(guest.install.call_args_list, [mock.call(fresh=True), mock.call()])
 
@@ -469,16 +474,47 @@ class GuestReboot(unittest.TestCase):
                            subprocess.CompletedProcess([], 0, 'old-boot\n', ''),
                            subprocess.CompletedProcess([], 0, 'new-boot\n', '')]
 
-                def poll(action):
+                def poll(action, timeout):
+                    self.assertEqual(timeout, 1200)
                     with self.assertRaisesRegex(AssertionError, 'has not rebooted'):
                         action()
                     action()
 
-                with mock.patch.object(guest, 'ssh', side_effect=results) as ssh, mock.patch.object(guests, 'wait_for', side_effect=poll), mock.patch.object(guests.time, 'sleep') as sleep:
+                with mock.patch.object(guest, 'ssh', side_effect=results) as ssh, mock.patch.object(guests, 'wait_for', side_effect=poll) as wait, mock.patch.object(guests.time, 'sleep') as sleep, mock.patch.object(guests, 'report_stage'):
                     guest.reboot()
                 self.assertEqual(ssh.call_args_list, [mock.call(command), mock.call('systemctl reboot', timeout=15),
                                                      mock.call(command, timeout=15), mock.call(command, timeout=15)])
+                wait.assert_called_once_with(mock.ANY, timeout=guests.GUEST_BOOT_TIMEOUT)
                 sleep.assert_called_once_with(10)
+
+    def test_unchanged_or_empty_boot_id_fails_at_boot_deadline_without_reboot_retry(self):
+        command = 'cat /proc/sys/kernel/random/boot_id'
+        for after in ('old-boot', ''):
+            with self.subTest(after=after):
+                guest = guests.Guest.__new__(guests.Guest)
+                results = [subprocess.CompletedProcess([], 0, 'old-boot', ''),
+                           subprocess.CompletedProcess([], 0, '', ''),
+                           subprocess.CompletedProcess([], 0, after, ''),
+                           subprocess.CompletedProcess([], 0, after, '')]
+                with mock.patch.object(guest, 'ssh', side_effect=results) as ssh, mock.patch.object(guests, 'report_stage'), mock.patch.object(guests.time, 'monotonic', side_effect=[0, 1199, 1200]), mock.patch.object(guests.time, 'sleep') as sleep:
+                    with self.assertRaisesRegex(AssertionError, 'Guest has not rebooted'):
+                        guest.reboot()
+                self.assertEqual(ssh.call_args_list, [mock.call(command), mock.call('systemctl reboot', timeout=15),
+                                                     mock.call(command, timeout=15), mock.call(command, timeout=15)])
+                self.assertEqual(sleep.call_args_list, [mock.call(10), mock.call(3)])
+
+    def test_failed_boot_readiness_preserves_original_transport_error(self):
+        guest = guests.Guest.__new__(guests.Guest)
+        command = 'cat /proc/sys/kernel/random/boot_id'
+        original = guests.SSHTransportTimeout(15, 'Connection timed out', command)
+        results = [subprocess.CompletedProcess([], 0, 'old-boot', ''),
+                   subprocess.CompletedProcess([], 0, '', ''), original, original]
+        with mock.patch.object(guest, 'ssh', side_effect=results) as ssh, mock.patch.object(guests, 'report_stage'), mock.patch.object(guests.time, 'monotonic', side_effect=[0, 1199, 1200]), mock.patch.object(guests.time, 'sleep'):
+            with self.assertRaises(guests.SSHTransportTimeout) as failure:
+                guest.reboot()
+        self.assertIs(failure.exception, original)
+        self.assertEqual(ssh.call_args_list, [mock.call(command), mock.call('systemctl reboot', timeout=15),
+                                             mock.call(command, timeout=15), mock.call(command, timeout=15)])
 
     def test_real_reboot_command_refusal_fails_without_waiting_or_retrying(self):
         guest = guests.Guest.__new__(guests.Guest)
@@ -611,6 +647,65 @@ class BrowserDiagnostics(unittest.TestCase):
         self.assertNotIn(token, stdout.getvalue() + stderr.getvalue() + str(failure.exception))
         self.assertIn('[redacted]', stdout.getvalue())
         self.assertIn('#token=[redacted]', stderr.getvalue())
+
+
+class VerificationProgress(unittest.TestCase):
+    def test_stage_output_contains_only_allowlisted_label_and_elapsed_time(self):
+        output = io.StringIO()
+        with mock.patch.object(guests, 'VERIFICATION_STARTED', 100), mock.patch.object(guests.time, 'monotonic', return_value=112.3), contextlib.redirect_stderr(output):
+            for stage in sorted(guests.VERIFICATION_STAGES):
+                guests.report_stage(stage)
+            before = output.getvalue()
+            with self.assertRaisesRegex(ValueError, '^Unknown verification stage$'):
+                guests.report_stage('https://private.example/first_run/access#token=private-token')
+            self.assertEqual(output.getvalue(), before)
+        snapshots = [guests.json.loads(line.split(': ', 1)[1]) for line in output.getvalue().splitlines()]
+        self.assertEqual({item['stage'] for item in snapshots}, guests.VERIFICATION_STAGES)
+        for item in snapshots:
+            self.assertEqual(set(item), {'stage', 'elapsed_seconds'})
+            self.assertEqual(item['elapsed_seconds'], 12.3)
+        for private in ('private.example', 'private-token', '#token=', 'systemctl', 'stdout', 'stderr'):
+            self.assertNotIn(private, output.getvalue())
+
+    def test_stage_reporting_cannot_fail_when_stderr_is_unavailable(self):
+        with mock.patch('builtins.print', side_effect=OSError('Broken pipe')):
+            guests.report_stage('reboot-ssh')
+
+    def test_boot_reports_captured_startup_boundaries_without_command_output(self):
+        guest = guests.Guest.__new__(guests.Guest)
+        image = b'disposable cloud image'
+        with tempfile.TemporaryDirectory() as temporary, contextlib.ExitStack() as stack:
+            root = Path(temporary)
+            work = root / 'work'
+            (work / 'diagnostics').mkdir(parents=True)
+            (root / 'deploy/verification').mkdir(parents=True)
+            guest.key = work / 'ssh'
+            guest.key.with_suffix('.pub').write_text('ssh-ed25519 disposable-test-public-key')
+            image_lock = {'ubuntu-24.04/arm64': {'url': 'https://example.invalid/base.qcow2',
+                'algorithm': 'sha256', 'checksum': guests.hashlib.sha256(image).hexdigest()}}
+            (root / 'deploy/verification/guests.lock.json').write_text(guests.json.dumps(image_lock))
+
+            def run(*args, **kwargs):
+                if args[0] == 'curl':
+                    (work / 'base.qcow2').write_bytes(image)
+                return subprocess.CompletedProcess([], 0, 'private command output', '')
+
+            stack.enter_context(mock.patch.object(guests, 'ROOT', root))
+            stack.enter_context(mock.patch.object(guests, 'WORK', work))
+            stack.enter_context(mock.patch.object(guests, 'run', side_effect=run))
+            popen = stack.enter_context(mock.patch.object(guests.subprocess, 'Popen'))
+            stack.enter_context(mock.patch.object(guests.atexit, 'register'))
+            wait = stack.enter_context(mock.patch.object(guest, 'wait_for_ssh'))
+            ssh = stack.enter_context(mock.patch.object(guest, 'ssh', return_value=subprocess.CompletedProcess([], 0, 'private SSH output', 'private stderr')))
+            output = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            guest.boot('ubuntu-24.04', 'arm64')
+            popen.call_args.kwargs['stdout'].close()
+        snapshots = [guests.json.loads(line.split(': ', 1)[1]) for line in output.getvalue().splitlines()]
+        self.assertEqual([item['stage'] for item in snapshots], ['guest-boot', 'guest-ssh', 'guest-cloud-init', 'guest-packages'])
+        self.assertNotIn('private', output.getvalue())
+        wait.assert_called_once_with()
+        self.assertEqual(ssh.call_args_list, [mock.call('cloud-init status --wait'),
+            mock.call('apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends -y curl ca-certificates python3')])
 
 
 class BootDiagnostics(unittest.TestCase):
