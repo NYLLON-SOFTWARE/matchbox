@@ -1,6 +1,6 @@
 # KRO browser checks
 
-Build the Rust binary, then run:
+Build the Rust binary and put OpenSSL with `req -addext` support on `PATH`, then run:
 
 ```sh
 npm ci --prefix parity
