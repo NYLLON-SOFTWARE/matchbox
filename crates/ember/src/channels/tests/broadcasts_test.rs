@@ -49,7 +49,7 @@ fn persisted_message_targets_never_use_client_correlation_ids() {
 async fn message_broadcasts() {
     let app = start().await;
     let mut kevin = app.connect("kevin").await;
-    room_messages(&app, &mut kevin, "designers").await;
+    let messages = room_messages(&app, &mut kevin, "designers").await;
     let unreads = identifier(json!({ "channel": "UnreadRoomsChannel" }));
     kevin.confirm(&unreads).await;
 
@@ -58,14 +58,16 @@ async fn message_broadcasts() {
 
     let (broadcasts, room, m) = (app.broadcasts.clone(), designers.clone(), message.clone());
     app.db.read(move |conn| broadcasts.message_create(conn, &room, &m, &FakePartials)).await.unwrap();
-    assert_eq!(
-        turbo_stream(&kevin.next_text().await),
-        format!(
-            r#"<turbo-stream action="append" target="messages_rooms_closed_{}"><template><div id="message_{1}">message {1}</div></template></turbo-stream>"#,
-            designers.id, message.id
-        )
+    // Different subscription streams can arrive in either order; require both exact deliveries.
+    let mut received = vec![kevin.next_text().await, kevin.next_text().await];
+    received.sort();
+    let append = format!(
+        r#"<turbo-stream action="append" target="messages_rooms_closed_{}"><template><div id="message_{1}">message {1}</div></template></turbo-stream>"#,
+        designers.id, message.id
     );
-    assert_eq!(kevin.next_text().await, delivery(&unreads, &format!(r#"{{"roomId":{}}}"#, designers.id)));
+    let mut expected = vec![delivery(&messages, &html_json(&append)), delivery(&unreads, &format!(r#"{{"roomId":{}}}"#, designers.id))];
+    expected.sort();
+    assert_eq!(received, expected);
 
     app.broadcasts.message_replace(&designers, &message, &FakePartials);
     assert_eq!(
